@@ -42,6 +42,7 @@ ref.py format
 import re
 import os
 import sys
+import json
 import subprocess
 import ctypes
 import argparse
@@ -257,6 +258,26 @@ def _stats(times_ms: list):
     return avg, med, min(times_ms), max(times_ms)
 
 
+def _stats_dict(times_ms: list):
+    avg, med, mn, mx = _stats(times_ms)
+    return {
+        "average_ms": avg,
+        "median_ms": med,
+        "min_ms": mn,
+        "max_ms": mx,
+    }
+
+
+def _write_json_out(path: str, payload: dict):
+    if not path:
+        return
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Results printer
 # ---------------------------------------------------------------------------
@@ -421,7 +442,7 @@ def _setup(cu_file, dim_values, ptr_size_override, arch, seed=None):
 # ---------------------------------------------------------------------------
 
 def run(cu_file, ref_file, dim_values, warmup, repeat,
-        ptr_size_override, arch, atol, rtol, seed):
+        ptr_size_override, arch, atol, rtol, seed, json_out=""):
     """Main benchmark pipeline.
 
     Steps:
@@ -447,11 +468,44 @@ def run(cu_file, ref_file, dim_values, warmup, repeat,
         _rtol   = float(getattr(ref_mod, "rtol", rtol))
         print(f"[reference] {ref_file}  (atol={_atol}, rtol={_rtol})\n")
 
+    gpu_index = torch.cuda.current_device()
+    gpu_name = torch.cuda.get_device_name(gpu_index)
+    result = {
+        "cu_file": os.path.abspath(cu_file),
+        "ref_file": os.path.abspath(ref_file) if has_ref else "",
+        "has_reference": has_ref,
+        "dims": dim_values,
+        "warmup": warmup,
+        "repeat": repeat,
+        "ptr_size_override": ptr_size_override,
+        "gpu_index": gpu_index,
+        "gpu_name": gpu_name,
+        "arch": arch,
+        "seed": seed,
+        "correctness": {
+            "checked": has_ref,
+            "passed": None,
+            "atol": _atol if has_ref else None,
+            "rtol": _rtol if has_ref else None,
+            "output_tensor_count": 0,
+        },
+        "kernel": None,
+        "reference": None,
+        "speedup_vs_reference": None,
+    }
+
     # -- compile + allocate ---------------------------------------------------
     (lib, params, kernel_tensors, kernel_call_args,
      argtypes, output_params, ptr_elems, total_ptr_bytes) = _setup(
         cu_file, dim_values, ptr_size_override, arch, seed=seed if has_ref else None
     )
+    result["signature"] = [
+        {"type": ptype, "name": pname, "is_const": is_const}
+        for ptype, pname, is_const in params
+    ]
+    result["ptr_elems"] = ptr_elems
+    result["total_ptr_bytes"] = total_ptr_bytes
+    result["correctness"]["output_tensor_count"] = len(output_params)
 
     if not output_params and has_ref:
         print("\n[warn] No output tensors detected (all pointer params are const). "
@@ -500,7 +554,9 @@ def run(cu_file, ref_file, dim_values, warmup, repeat,
         print(f"  Result    : {_color(result_str, validation_passed)}")
         print("=" * 60)
 
+        result["correctness"]["passed"] = validation_passed
         if not validation_passed:
+            _write_json_out(json_out, result)
             sys.exit(1)
 
     # -------------------------------------------------------------------------
@@ -545,8 +601,18 @@ def run(cu_file, ref_file, dim_values, warmup, repeat,
     # -------------------------------------------------------------------------
     avg_k, med_k, mn_k, mx_k = _stats(times_kernel)
 
+    result["kernel"] = _stats_dict(times_kernel)
+    result["kernel"]["bandwidth_gbps_rough"] = (
+        total_ptr_bytes / (avg_k / 1000) / 1e9 if avg_k > 0 else None
+    )
+
     if has_ref:
         avg_r, med_r, mn_r, mx_r = _stats(times_ref)
+        result["reference"] = _stats_dict(times_ref)
+        result["reference"]["bandwidth_gbps_rough"] = (
+            total_ptr_bytes / (avg_r / 1000) / 1e9 if avg_r > 0 else None
+        )
+        result["speedup_vs_reference"] = avg_r / avg_k if avg_k > 0 else None
         _print_results(
             "CUDA Kernel", avg_k, med_k, mn_k, mx_k,
             total_ptr_bytes, ptr_elems, cu_file, dim_values, arch, ref_avg=avg_r,
@@ -561,6 +627,8 @@ def run(cu_file, ref_file, dim_values, warmup, repeat,
             "CUDA Kernel", avg_k, med_k, mn_k, mx_k,
             total_ptr_bytes, ptr_elems, cu_file, dim_values, arch,
         )
+
+    _write_json_out(json_out, result)
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +663,8 @@ def main():
                         help="Relative tolerance for validation (default: 1e-3)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for input tensors when validating (default: 42)")
+    parser.add_argument("--json-out", type=str, default="",
+                        help="Optional path to write structured benchmark results as JSON")
 
     args, unknown = parser.parse_known_args()
 
@@ -620,6 +690,7 @@ def main():
         atol              = args.atol,
         rtol              = args.rtol,
         seed              = args.seed,
+        json_out          = args.json_out,
     )
 
 

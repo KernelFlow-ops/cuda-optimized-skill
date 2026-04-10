@@ -1,27 +1,29 @@
 ---
 name: kernel-benchmark
-description: Compile, validate, and benchmark a CUDA kernel against an optional Python reference by driving `skills/kernel-benchmark/scripts/benchmark.py`. Use when Codex needs to 验证 `.cu` kernel 正确性、做 baseline 性能测试、比较 kernel 与 reference 的 speedup、按 `extern "C" void solve(...)` 签名推断参数，或在进入 NCU 分析前先得到稳定 benchmark 结果。
+description: Compile, validate, and benchmark a CUDA kernel against an optional Python reference by driving `skills/optimized-skill/kernel-benchmark/scripts/benchmark.py`. Use when Claude needs to 验证 `.cu` kernel 正确性、做 baseline 性能测试、比较 kernel 与 reference 的 speedup、按 `extern "C" void solve(...)` 签名推断参数，或在进入 NCU 分析前先得到稳定 benchmark 结果。
 ---
 
 # Kernel Benchmark
 
-通过 `skills/kernel-benchmark/scripts/benchmark.py` 编译、验证、压测 `extern "C" void solve(...)` 风格的 CUDA kernel。
+通过 `skills/optimized-skill/kernel-benchmark/scripts/benchmark.py` 编译、验证、压测 `extern "C" void solve(...)` 风格的 CUDA kernel。
 所有命令都从仓库根目录运行。
 
 ## 共享文档入口
 
-按需查这些共享文档：
-- timing 和 bandwidth: `../cuda_skill/references/best-practices-guide/9-performance-metrics.md`
-- 调试和 sanitizer: `../cuda_skill/references/debugging-tools.md`
-- 共享 workflow: `../cuda_skill/references/workflow-checklists.md`
-- GPU 架构能力: `../cuda_skill/references/cuda-guide/05-appendices/compute-capabilities.md`
+按需查这些现有文档：
+- 总体 workflow: `../reference/optim.md`
+- memory 优化: `../reference/memory-optim.md`
+- compute 优化: `../reference/compute-optim.md`
+- sync 优化: `../reference/sync-optim.md`
 
 ## 输入
 
 - 必需：`.cu` 文件
 - 可选：reference `.py`
 - 可选：维度参数，如 `--M=... --N=... --K=...`
-- 可选：`--warmup`、`--repeat`、`--arch`
+- 可选：`--warmup`、`--repeat`、`--arch`、`--gpu`、`--ptr-size`
+- 可选：`--atol`、`--rtol`、`--seed`
+- 可选：`--json-out=<file>`，把结构化结果写成 JSON，便于上层编排脚本复用
 
 ## reference 推断规则
 
@@ -50,22 +52,29 @@ description: Compile, validate, and benchmark a CUDA kernel against an optional 
 只有 benchmark：
 
 ```bash
-python skills/kernel-benchmark/scripts/benchmark.py <cu_file> \
+python skills/optimized-skill/kernel-benchmark/scripts/benchmark.py <cu_file> \
     [--DIM=VALUE ...] --warmup=10 --repeat=20
 ```
 
 验证加 benchmark：
 
 ```bash
-python skills/kernel-benchmark/scripts/benchmark.py <cu_file> \
+python skills/optimized-skill/kernel-benchmark/scripts/benchmark.py <cu_file> \
     --ref=<ref_file> [--DIM=VALUE ...] --warmup=10 --repeat=20
 ```
 
 指定架构：
 
 ```bash
-python skills/kernel-benchmark/scripts/benchmark.py <cu_file> \
+python skills/optimized-skill/kernel-benchmark/scripts/benchmark.py <cu_file> \
     --ref=<ref_file> [--DIM=VALUE ...] --arch=sm_90
+```
+
+输出结构化 JSON：
+
+```bash
+python skills/optimized-skill/kernel-benchmark/scripts/benchmark.py <cu_file> \
+    --ref=<ref_file> [--DIM=VALUE ...] --json-out=benchmark_result.json
 ```
 
 ## benchmark.py 的实际行为
@@ -76,10 +85,11 @@ python skills/kernel-benchmark/scripts/benchmark.py <cu_file> \
 - 用 `nvcc` 编译为共享库
 - 有 reference 时先跑 correctness，再 benchmark reference 和 kernel
 - 没有 reference 时，先打印输入输出 preview，再 benchmark kernel
+- 若给了 `--json-out`，则额外产出结构化结果，包含 correctness、GPU、arch、dims、kernel/reference latency、speedup 等
 
 注意：
 - 输出中的 `~Bandwidth` 是“按所有指针 buffer 总字节数估算”的粗指标，只能看趋势，不能替代精确 effective bandwidth。
-- 真正的 effective bandwidth 需要按 kernel 实际读写字节数手算，可参考 `9-performance-metrics.md`。
+- 真正的 effective bandwidth 需要按 kernel 实际读写字节数手算。
 
 ## 如何解读结果
 
@@ -101,13 +111,7 @@ python skills/kernel-benchmark/scripts/benchmark.py <cu_file> \
 立即停止后续性能结论，优先反馈：
 - 失败的输出 tensor
 - 最大误差和首个错误位置
-- 建议先跑：
-
-```bash
-compute-sanitizer --tool memcheck <program>
-compute-sanitizer --tool racecheck <program>
-compute-sanitizer --tool synccheck <program>
-```
+- 建议先做内存、竞争和同步问题排查
 
 ### 编译失败
 
@@ -135,6 +139,18 @@ compute-sanitizer --tool synccheck <program>
 - speedup
 - 是否建议进入 `ncu-rep-analyze`
 
+如果给了 `--json-out`，JSON 至少要包含：
+- `cu_file`
+- `ref_file`
+- `has_reference`
+- `dims`
+- `gpu_name`
+- `arch`
+- `correctness`
+- `kernel`
+- `reference`
+- `speedup_vs_reference`
+
 完整实际执行命令必须原样回显，至少包含：
 - `.cu` 路径
 - `--ref`
@@ -142,3 +158,4 @@ compute-sanitizer --tool synccheck <program>
 - `--arch`
 - `--warmup`
 - `--repeat`
+- `--json-out`（若使用）

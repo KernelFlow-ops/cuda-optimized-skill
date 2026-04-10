@@ -1,24 +1,20 @@
 ---
 name: ncu-rep-analyze
-description: Profile a CUDA kernel with Nsight Compute or analyze an existing `.ncu-rep` report to diagnose bottlenecks and produce actionable optimization guidance. Use when Codex needs to 解释 NCU 指标、定位 kernel 为什么慢、生成 fresh `.ncu-rep`、判断 memory/latency/compute/occupancy 瓶颈，或把报告结论整理成下一轮 `cuda-code-gen` 可直接使用的优化建议。
+description: Profile a CUDA kernel with Nsight Compute or analyze an existing `.ncu-rep` report to diagnose bottlenecks and produce actionable optimization guidance. Use when Claude needs to 解释 NCU 指标、定位 kernel 为什么慢、生成 fresh `.ncu-rep`、判断 memory/latency/compute/occupancy 瓶颈，或把报告结论整理成下一轮算子优化可直接使用的建议。
 ---
 
 # NCU Profiling and Analysis
 
 这个 skill 负责回答“这个 kernel 为什么慢”。
-如果输入是 `.cu`，优先为“当前版本 kernel”生成 fresh `.ncu-rep`；如果输入是现成 `.ncu-rep`，则解释现有报告。
+如果输入是 `.cu`，优先为当前版本 kernel 生成 fresh `.ncu-rep`；如果输入是现成 `.ncu-rep`，则解释现有报告。
 
 ## 共享文档入口
 
-优先查这些共享文档：
-- `../cuda_skill/references/ncu-guide.md`
-- `../cuda_skill/references/performance-traps.md`
-- `../cuda_skill/references/workflow-checklists.md`
-- `../cuda_skill/references/optimization-playbook.md`
-- `../cuda_skill/references/best-practices-guide/9-performance-metrics.md`
-- `../cuda_skill/references/best-practices-guide/10-memory-optimizations.md`
-- `../cuda_skill/references/best-practices-guide/11-execution-configuration-optimizations.md`
-- `../cuda_skill/references/nsys-guide.md`
+优先查这些现有文档：
+- 总体迭代 workflow: `../reference/optim.md`
+- memory 优化: `../reference/memory-optim.md`
+- compute 优化: `../reference/compute-optim.md`
+- sync 优化: `../reference/sync-optim.md`
 
 ## 文件策略
 
@@ -50,7 +46,7 @@ ncu --target-processes all \
     --section MemoryWorkloadAnalysis \
     --section SchedulerStatistics \
     -o {kernel_dir}/{kernel_stem} -f \
-    python skills/kernel-benchmark/scripts/benchmark.py <cu_file> \
+    python skills/optimized-skill/kernel-benchmark/scripts/benchmark.py <cu_file> \
     [--DIM=VALUE ...] --repeat=22
 ```
 
@@ -117,7 +113,7 @@ sm__warps_active.avg_pct_of_peak_sustained_elapsed \
 | `LATENCY_BOUND` | SM 低、Memory 也不高、occupancy 尚可、eligible warps 低 | ILP、unroll、double buffering、减少长依赖链 |
 | `COMPUTE_BOUND` | SM 高、SM Busy 高、Memory 不是主问题 | FMA、低精度、Tensor Core |
 | `OCCUPANCY_BOUND` | achieved occupancy 低，且限制因子明确 | 降 registers/smem、改 block size、`__launch_bounds__` |
-| `HOST_OR_LAUNCH_BOUND` | kernel 很短、网格很小、GPU 指标都不高 | 不要继续盲改 kernel，转去 `nsys` |
+| `HOST_OR_LAUNCH_BOUND` | kernel 很短、网格很小、GPU 指标都不高 | 不要继续盲改 kernel，转去更上层时序分析 |
 | `MIXED_BOUND` | 多项都一般，没有单一主症状 | 只选最明确的一类先验证 |
 
 ## 具体判断要点
@@ -154,15 +150,14 @@ sm__warps_active.avg_pct_of_peak_sustained_elapsed \
 如果 theoretical occupancy 也低，说明资源配置本身就是瓶颈。
 如果 theoretical 高但 achieved 低，更多是调度或依赖链问题。
 
-## 什么时候改用 nsys
+## 什么时候转向更上层时序分析
 
 出现这些情况时，不要继续只盯着 NCU：
 - low SM 且 low Memory
 - kernel 本身很短，但调用次数非常多
 - 明显怀疑 CPU 端准备、同步、分配或 launch gap
 
-这时改查：
-- `../cuda_skill/references/nsys-guide.md`
+这时要明确指出：当前问题可能不是单个 kernel 内部瓶颈，不能继续只靠 NCU 下结论。
 
 ## 不要做的事
 
@@ -182,7 +177,7 @@ sm__warps_active.avg_pct_of_peak_sustained_elapsed \
 - 主瓶颈类型
 - 判断依据
 - 高优先级优化建议
-- 如需转 `nsys` 或 `compute-sanitizer` 的明确建议
+- 是否需要转更上层时序分析或 correctness 排查
 
 如果从 `.cu` 生成了新报告，还要把：
 - targeted NCU 命令
@@ -190,7 +185,7 @@ sm__warps_active.avg_pct_of_peak_sustained_elapsed \
 - full NCU 命令
 - full `.ncu-rep` 路径
 - `ncu --import <file.ncu-rep> --print-summary per-kernel` 这类导入查看命令
-- `_analysis.md` 路径
+- `_analysis.md` 或 summary 文件路径
 
 一起交付。
 
