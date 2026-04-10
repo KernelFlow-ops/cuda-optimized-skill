@@ -80,6 +80,7 @@ description: Run a CUDA operator optimization loop that enforces correctness val
 首轮目标：
 - 先做一版高质量、覆盖较广的候选实现。
 - 尽量把通用收益高的 memory / compute / sync 优化一次性吃进去。
+- 明确评估是否可以加入双缓冲 / 多级流水线：在 Shared Memory 或寄存器中准备两组 buffer，让当前批次计算与下一批次加载重叠。
 - 产出 first-pass 的 targeted/full NCU 报告，作为后续轮次的基准。
 
 ### 后续迭代（v1 之后）
@@ -89,10 +90,14 @@ description: Run a CUDA operator optimization loop that enforces correctness val
 规则：
 - 先看上一轮 full NCU，再参考 targeted NCU。
 - 每一轮只优先解决 1 到 2 个最明确的瓶颈。
+- 每一轮都要显式评估“双缓冲 / 多级流水线”是否适合当前 kernel：
+  - 阶段1：buffer A 计算，buffer B 加载下一批数据
+  - 阶段2：buffer B 计算，buffer A 加载下一批数据
+- 如果适合，就把双缓冲 / 多级流水线纳入本轮优化候选；如果不适合，也要明确写出原因，例如数据复用不足、tile 结构不匹配、寄存器或 shared memory 压力过高。
 - 优化方向要和具体 NCU 信号绑定，例如：
   - coalescing 差 -> 优先修访存布局 / vectorization / tiling
   - occupancy 低 -> 优先修寄存器、smem、block size
-  - latency bound -> 优先�� ILP、依赖链、同步粒度
+  - latency bound -> 优先修 ILP、依赖链、同步粒度，并优先考虑双缓冲 / 多级流水线隐藏访存延迟
   - compute bound -> 优先修 Tensor Core、FMA、低精度路径
 - 不要在后续轮次继续无差别叠加新技巧；每轮改动都要能解释“它是在修上一轮 NCU 的哪个短板”。
 
@@ -149,6 +154,7 @@ python skills/optimized-skill/operator-optimize-loop/scripts/optimize_loop.py <n
 
 - 首轮优化按 `reference/` 做尽可能广覆盖但仍然合理的组合优化；从第二轮开始，每轮先读上一轮 full NCU 报告，再做针对性修正。
 - 每轮改动都要能解释它解决的是哪一个具体瓶颈，不要无差别继续堆优化技巧。
+- 每一轮都要检查双缓冲 / 多级流水线是否值得引入或继续保留，并在 proposal 中写明判断依据。
 - 不要把 targeted sections 的结论当作最终结论；最终交付必须引用 winning version 的 full NCU 报告。
 - correctness 失败的版本可以保留在 run 目录中，但必须明确标记为 rejected，不能参与 best 评选。
 - 如果 `ncu` 不可用、导入失败或 full 报告缺失，要明确写出失败原因并停止把该版本当作最终答案。

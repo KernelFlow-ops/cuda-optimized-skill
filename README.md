@@ -35,10 +35,10 @@
 2. 跑 benchmark，记录 baseline
 3. 跑 targeted NCU
 4. 跑 full NCU
-5. 第一次优化尽可能吸收 `reference/` 中适配当前 kernel 的 memory / compute / sync 优化方法
+5. 第一次优化尽可能吸收 `reference/` 中适配当前 kernel 的 memory / compute / sync 优化方法，并显式评估是否引入双缓冲 / 多级流水线
 6. 生成第一版候选 kernel
 7. 对新版本重复 correctness、benchmark、targeted/full NCU
-8. 从第二轮开始，针对上一轮 full NCU 暴露的最主要不足做定向修正
+8. 从第二轮开始，针对上一轮 full NCU 暴露的最主要不足做定向修正，并在每轮继续判断双缓冲 / 多级流水线是否值得加入或保留
 9. 在用户设定的迭代轮数内选出最优版本并交付 full NCU 报告和 benchmark 对比
 
 ## 用户可配置参数
@@ -156,6 +156,7 @@ optimize_runs/
 ## 使用建议
 
 - 第一次优化时，优先从 `reference/` 下已有知识库中尽可能多地吸收适配当前 kernel 的优化方法。
+- 每一轮都要评估双缓冲 / 多级流水线是否适合当前 kernel：一组 buffer 计算时，另一组 buffer 预取下一批数据。
 - 从第二轮开始，每轮先读上一轮 full NCU，再决定这轮只解决哪些最明确的短板。
 - correctness 失败的版本不能参与性能结论。
 - 最终交付不能只引用 targeted 结果，必须带 winning version 的 full NCU 报告。
@@ -182,3 +183,8 @@ optimize_runs/
 ### 4. 多轮没有收益
 
 可以提前停止，把当前 best 作为最终候选，并说明后续收益递减。
+
+
+### 5、进行conv算子核的测试与torch中卷积核性能对比
+
+![alt text](/asset/image/README/ff059117-e7ca-4f7f-8af4-443ff26f678f.png)
