@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Evaluate one CUDA kernel iteration inside an optimization loop.
+"""Evaluate one operator iteration inside an optimization loop.
 
 This script does the repeatable mechanics for each version:
-1. Snapshot the current kernel into a run directory.
+1. Snapshot the current operator implementation into a run directory.
 2. Run correctness validation + benchmark via benchmark.py.
-3. Generate targeted and full Nsight Compute reports.
-4. Import summary/details text from the generated .ncu-rep files.
+3. Generate targeted and full Nsight Compute reports when the backend supports NCU.
+4. Import summary/details text from generated .ncu-rep files.
 5. Update a run manifest and final summary so Claude can compare iterations.
 
 Code generation and optimization decisions are intentionally left to the skill.
-The skill edits or creates the next kernel version, then invokes this script again
+The skill edits or creates the next operator version, then invokes this script again
 for the next iteration in the same run directory.
 """
 
@@ -35,18 +35,36 @@ TARGETED_SECTIONS = [
     "SchedulerStats",
 ]
 
+BACKEND_REFERENCE_DOCS = {
+    "cuda": [
+        "skills/optimized-skill/reference/cuda/optim.md",
+        "skills/optimized-skill/reference/cuda/memory-optim.md",
+        "skills/optimized-skill/reference/cuda/compute-optim.md",
+        "skills/optimized-skill/reference/cuda/sync-optim.md",
+    ],
+    "cutlass": [
+        "skills/optimized-skill/reference/cutlass/cutlass-optim.md",
+    ],
+    "triton": [
+        "skills/optimized-skill/reference/triton/triton-optim.md",
+    ],
+}
+
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
 
 
 def shell_join(parts: list[str]) -> str:
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
+
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
 
 
 def read_json(path: Path, default: Any) -> Any:
@@ -55,13 +73,16 @@ def read_json(path: Path, default: Any) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+
 def valid_report_exists(path: Path) -> bool:
     return path.exists() and path.stat().st_size > 0
+
 
 
 def run_command(cmd: list[str], stdout_path: Path, stderr_path: Path) -> subprocess.CompletedProcess:
@@ -80,11 +101,13 @@ def run_command(cmd: list[str], stdout_path: Path, stderr_path: Path) -> subproc
     return result
 
 
+
 def trim_output(text: str, max_lines: int = 20) -> str:
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     if len(lines) <= max_lines:
         return "\n".join(lines)
     return "\n".join(lines[:max_lines] + ["..."])
+
 
 
 def add_requirement(
@@ -106,6 +129,7 @@ def add_requirement(
     )
     if required and not ok:
         errors.append(f"{name}: {detail}")
+
 
 
 def run_probe(cmd: list[str]) -> dict[str, Any]:
@@ -132,8 +156,10 @@ def run_probe(cmd: list[str]) -> dict[str, Any]:
     }
 
 
+
 def candidate_has_path(candidate: str) -> bool:
     return any(sep in candidate for sep in ("\\", "/"))
+
 
 
 def find_cuda_roots() -> list[Path]:
@@ -145,6 +171,7 @@ def find_cuda_roots() -> list[Path]:
     return roots
 
 
+
 def find_ncu_roots() -> list[Path]:
     roots: list[Path] = []
     program_files = os.environ.get("ProgramFiles")
@@ -153,6 +180,7 @@ def find_ncu_roots() -> list[Path]:
         if nvidia_dir.exists():
             roots.extend(sorted(nvidia_dir.glob("Nsight Compute*")))
     return roots
+
 
 
 def resolve_executable(candidate: str, tool_name: str) -> str:
@@ -186,6 +214,7 @@ def resolve_executable(candidate: str, tool_name: str) -> str:
     return ""
 
 
+
 def probe_executable(candidate: str, tool_name: str, version_args: list[str]) -> dict[str, Any]:
     resolved = resolve_executable(candidate, tool_name)
     info: dict[str, Any] = {
@@ -205,6 +234,7 @@ def probe_executable(candidate: str, tool_name: str, version_args: list[str]) ->
     info["version_returncode"] = probe["returncode"]
     info["version_output"] = trim_output(output)
     return info
+
 
 
 def probe_nvidia_smi() -> dict[str, Any]:
@@ -255,6 +285,7 @@ def probe_nvidia_smi() -> dict[str, Any]:
     return info
 
 
+
 def probe_torch_cuda(gpu_index: int) -> dict[str, Any]:
     info: dict[str, Any] = {
         "importable": False,
@@ -270,7 +301,7 @@ def probe_torch_cuda(gpu_index: int) -> dict[str, Any]:
     }
     try:
         import torch  # type: ignore
-    except Exception as exc:  # pragma: no cover - environment dependent
+    except Exception as exc:
         info["error"] = str(exc)
         return info
 
@@ -287,16 +318,32 @@ def probe_torch_cuda(gpu_index: int) -> dict[str, Any]:
                 major, minor = torch.cuda.get_device_capability(gpu_index)
                 info["selected_gpu_compute_capability"] = f"{major}.{minor}"
                 info["selected_sm"] = f"sm_{major}{minor}"
-    except Exception as exc:  # pragma: no cover - environment dependent
+    except Exception as exc:
         info["error"] = str(exc)
     return info
+
+
+
+def infer_backend(solution_file: Path, backend: str) -> str:
+    if backend != "auto":
+        return backend
+    if solution_file.suffix.lower() == ".py":
+        return "triton"
+    return "cuda"
+
+
+
+def backend_supports_ncu(backend: str) -> bool:
+    return backend in {"cuda", "cutlass", "triton"}
+
 
 
 def collect_preflight(
     args: argparse.Namespace,
     benchmark_script: Path,
-    cu_file: Path,
+    solution_file: Path,
     ref_file: Path | None,
+    backend: str,
 ) -> dict[str, Any]:
     warnings: list[str] = []
     errors: list[str] = []
@@ -305,6 +352,7 @@ def collect_preflight(
     preflight: dict[str, Any] = {
         "checked_at": now_iso(),
         "ready": False,
+        "backend": backend,
         "python_executable": sys.executable,
         "python_version": sys.version.splitlines()[0],
         "selected_gpu_index": args.gpu,
@@ -318,27 +366,16 @@ def collect_preflight(
         "errors": errors,
     }
 
+    add_requirement(requirements, errors, "solution file", solution_file.exists(), str(solution_file))
+    expected_suffix_ok = solution_file.suffix.lower() == ".py" if backend == "triton" else solution_file.suffix.lower() == ".cu"
     add_requirement(
         requirements,
         errors,
-        "kernel file",
-        cu_file.exists(),
-        str(cu_file),
+        "solution suffix",
+        expected_suffix_ok,
+        solution_file.suffix or "(no suffix)",
     )
-    add_requirement(
-        requirements,
-        errors,
-        "kernel suffix",
-        cu_file.suffix.lower() == ".cu",
-        cu_file.suffix or "(no suffix)",
-    )
-    add_requirement(
-        requirements,
-        errors,
-        "benchmark.py",
-        benchmark_script.exists(),
-        str(benchmark_script),
-    )
+    add_requirement(requirements, errors, "benchmark.py", benchmark_script.exists(), str(benchmark_script))
     add_requirement(
         requirements,
         errors,
@@ -361,25 +398,15 @@ def collect_preflight(
         errors,
         "CUDA runtime",
         torch_info["cuda_available"],
-        (
-            f"torch CUDA {torch_info['cuda_version']}"
-            if torch_info["cuda_available"]
-            else (torch_info["error"] or "torch.cuda.is_available() returned false")
-        ),
+        f"torch CUDA {torch_info['cuda_version']}" if torch_info["cuda_available"] else (torch_info["error"] or "torch.cuda.is_available() returned false"),
     )
-    selected_gpu_ok = (
-        torch_info["cuda_available"] and 0 <= args.gpu < int(torch_info["device_count"])
-    )
+    selected_gpu_ok = torch_info["cuda_available"] and 0 <= args.gpu < int(torch_info["device_count"])
     add_requirement(
         requirements,
         errors,
         f"GPU index {args.gpu}",
         selected_gpu_ok,
-        (
-            f"{torch_info['selected_gpu_name']} ({torch_info['selected_sm']})"
-            if selected_gpu_ok
-            else f"available device count: {torch_info['device_count']}"
-        ),
+        f"{torch_info['selected_gpu_name']} ({torch_info['selected_sm']})" if selected_gpu_ok else f"available device count: {torch_info['device_count']}",
     )
 
     nvidia_smi_info = probe_nvidia_smi()
@@ -410,46 +437,66 @@ def collect_preflight(
             gpu_info["driver_version"] = smi_gpu["driver_version"]
     preflight["gpu"] = gpu_info
 
-    nvcc_info = probe_executable(args.nvcc_bin, "nvcc", ["--version"])
-    preflight["nvcc"] = nvcc_info
-    add_requirement(
-        requirements,
-        errors,
-        "nvcc executable",
-        nvcc_info["exists"],
-        nvcc_info["resolved"] or f"cannot resolve {args.nvcc_bin}",
-    )
-    if nvcc_info["exists"] and nvcc_info.get("version_returncode") not in (None, 0):
-        warnings.append("nvcc exists but `--version` did not exit cleanly.")
+    if backend in {"cuda", "cutlass"}:
+        nvcc_info = probe_executable(args.nvcc_bin, "nvcc", ["--version"])
+        preflight["nvcc"] = nvcc_info
+        add_requirement(
+            requirements,
+            errors,
+            "nvcc executable",
+            nvcc_info["exists"],
+            nvcc_info["resolved"] or f"cannot resolve {args.nvcc_bin}",
+        )
+        if nvcc_info["exists"] and nvcc_info.get("version_returncode") not in (None, 0):
+            warnings.append("nvcc exists but `--version` did not exit cleanly.")
+    else:
+        preflight["nvcc"] = {
+            "requested": args.nvcc_bin,
+            "resolved": "",
+            "exists": False,
+            "version_command": "",
+            "version_returncode": None,
+            "version_output": "not required for triton backend",
+        }
 
-    ncu_info = probe_executable(args.ncu_bin, "ncu", ["--version"])
-    preflight["ncu"] = ncu_info
-    add_requirement(
-        requirements,
-        errors,
-        "ncu executable",
-        ncu_info["exists"],
-        ncu_info["resolved"] or f"cannot resolve {args.ncu_bin}",
-    )
-    if ncu_info["exists"] and ncu_info.get("version_returncode") not in (None, 0):
-        warnings.append("ncu exists but `--version` did not exit cleanly.")
+    if backend_supports_ncu(backend):
+        ncu_info = probe_executable(args.ncu_bin, "ncu", ["--version"])
+        preflight["ncu"] = ncu_info
+        add_requirement(
+            requirements,
+            errors,
+            "ncu executable",
+            ncu_info["exists"],
+            ncu_info["resolved"] or f"cannot resolve {args.ncu_bin}",
+        )
+        if ncu_info["exists"] and ncu_info.get("version_returncode") not in (None, 0):
+            warnings.append("ncu exists but `--version` did not exit cleanly.")
+    else:
+        preflight["ncu"] = {
+            "requested": args.ncu_bin,
+            "resolved": "",
+            "exists": False,
+            "version_command": "",
+            "version_returncode": None,
+            "version_output": "not required for this backend",
+        }
 
     if args.arch and gpu_info.get("sm") and args.arch != gpu_info["sm"]:
-        warnings.append(
-            f"--arch={args.arch} does not match selected GPU capability {gpu_info['sm']}."
-        )
+        warnings.append(f"--arch={args.arch} does not match selected GPU capability {gpu_info['sm']}.")
 
     preflight["ready"] = not errors
     return preflight
 
 
+
 def render_preflight_markdown(preflight: dict[str, Any]) -> str:
     lines = [
-        "# CUDA Optimization Loop Preflight",
+        "# Operator Optimization Loop Preflight",
         "",
         "## Status",
         f"- ready: {'yes' if preflight.get('ready') else 'no'}",
         f"- checked at: {preflight.get('checked_at', '')}",
+        f"- backend: {preflight.get('backend', 'unknown')}",
         f"- python: {preflight.get('python_executable', '')}",
         f"- python version: {preflight.get('python_version', '')}",
         f"- selected gpu index: {preflight.get('selected_gpu_index')}",
@@ -487,10 +534,10 @@ def render_preflight_markdown(preflight: dict[str, Any]) -> str:
             "",
             "## Tools",
             f"- nvcc requested: {nvcc.get('requested', '')}",
-            f"- nvcc resolved: {nvcc.get('resolved') or 'not found'}",
+            f"- nvcc resolved: {nvcc.get('resolved') or 'not required'}",
             f"- nvcc version: {nvcc.get('version_output') or 'n/a'}",
             f"- ncu requested: {ncu.get('requested', '')}",
-            f"- ncu resolved: {ncu.get('resolved') or 'not found'}",
+            f"- ncu resolved: {ncu.get('resolved') or 'not required'}",
             f"- ncu version: {ncu.get('version_output') or 'n/a'}",
             "",
             "## Environment variables",
@@ -516,24 +563,28 @@ def render_preflight_markdown(preflight: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def ensure_run_dir(cu_file: Path, run_dir_arg: str) -> Path:
+
+def ensure_run_dir(solution_file: Path, run_dir_arg: str) -> Path:
     if run_dir_arg:
         run_dir = Path(run_dir_arg).resolve()
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = (cu_file.resolve().parent / "optimize_runs" / f"run_{ts}").resolve()
+        run_dir = (solution_file.resolve().parent / "optimize_runs" / f"run_{ts}").resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
 
-def load_manifest(manifest_path: Path, args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
+
+def load_manifest(manifest_path: Path, args: argparse.Namespace, run_dir: Path, solution_file: Path, backend: str) -> dict[str, Any]:
     manifest = read_json(manifest_path, None)
     if manifest is None:
         manifest = {
             "created_at": now_iso(),
             "updated_at": now_iso(),
             "run_dir": str(run_dir),
-            "source_cu_file": str(Path(args.cu_file).resolve()),
+            "backend": backend,
+            "source_file": str(solution_file.resolve()),
+            "source_cu_file": str(solution_file.resolve()),
             "reference_file": str(Path(args.ref).resolve()) if args.ref else "",
             "max_iterations": args.max_iterations,
             "warmup": args.warmup,
@@ -543,12 +594,21 @@ def load_manifest(manifest_path: Path, args: argparse.Namespace, run_dir: Path) 
             "ptr_size": args.ptr_size,
             "seed": args.seed,
             "dims_args": list(args.dim_args),
+            "reference_docs": BACKEND_REFERENCE_DOCS.get(backend, []),
+            "ncu_supported": backend_supports_ncu(backend),
             "preflight": {},
             "iterations": [],
             "best_iteration": None,
             "best_kernel_path": "",
         }
+    else:
+        manifest["backend"] = backend
+        manifest["source_file"] = str(solution_file.resolve())
+        manifest["source_cu_file"] = str(solution_file.resolve())
+        manifest["reference_docs"] = BACKEND_REFERENCE_DOCS.get(backend, [])
+        manifest["ncu_supported"] = backend_supports_ncu(backend)
     return manifest
+
 
 
 def pick_iteration_index(manifest: dict[str, Any], requested_iteration: int) -> int:
@@ -557,11 +617,13 @@ def pick_iteration_index(manifest: dict[str, Any], requested_iteration: int) -> 
     return len(manifest.get("iterations", []))
 
 
-def build_benchmark_cmd(args: argparse.Namespace, benchmark_script: Path, snapshot_cu: Path, benchmark_json: Path) -> list[str]:
+
+def build_benchmark_cmd(args: argparse.Namespace, benchmark_script: Path, snapshot_file: Path, benchmark_json: Path, backend: str) -> list[str]:
     cmd = [
         sys.executable,
         str(benchmark_script),
-        str(snapshot_cu),
+        str(snapshot_file),
+        f"--backend={backend}",
         f"--warmup={args.warmup}",
         f"--repeat={args.repeat}",
         f"--gpu={args.gpu}",
@@ -569,8 +631,9 @@ def build_benchmark_cmd(args: argparse.Namespace, benchmark_script: Path, snapsh
         f"--atol={args.atol}",
         f"--rtol={args.rtol}",
         f"--json-out={benchmark_json}",
-        f"--nvcc-bin={args.nvcc_bin}",
     ]
+    if backend_supports_ncu(backend):
+        cmd.append(f"--nvcc-bin={args.nvcc_bin}")
     if args.ref:
         cmd.append(f"--ref={Path(args.ref).resolve()}")
     if args.arch:
@@ -579,6 +642,7 @@ def build_benchmark_cmd(args: argparse.Namespace, benchmark_script: Path, snapsh
         cmd.append(f"--ptr-size={args.ptr_size}")
     cmd.extend(args.dim_args)
     return cmd
+
 
 
 def build_targeted_ncu_cmd(args: argparse.Namespace, bench_cmd: list[str], out_prefix: Path) -> list[str]:
@@ -602,6 +666,7 @@ def build_targeted_ncu_cmd(args: argparse.Namespace, bench_cmd: list[str], out_p
     return cmd
 
 
+
 def build_full_ncu_cmd(args: argparse.Namespace, bench_cmd: list[str], out_prefix: Path) -> list[str]:
     cmd = [
         args.ncu_bin,
@@ -623,6 +688,7 @@ def build_full_ncu_cmd(args: argparse.Namespace, bench_cmd: list[str], out_prefi
     return cmd
 
 
+
 def import_ncu_report(args: argparse.Namespace, rep_path: Path, summary_txt: Path, details_txt: Path) -> dict[str, Any]:
     summary_cmd = [args.ncu_bin, "--import", str(rep_path), "--print-summary", "per-kernel"]
     details_cmd = [args.ncu_bin, "--import", str(rep_path), "--page", "details"]
@@ -640,13 +706,15 @@ def import_ncu_report(args: argparse.Namespace, rep_path: Path, summary_txt: Pat
     }
 
 
+
 def choose_best_iteration(iterations: list[dict[str, Any]]) -> dict[str, Any] | None:
     candidates = []
     for item in iterations:
         bench = item.get("benchmark_result") or {}
         kernel = bench.get("kernel") or {}
         correctness = bench.get("correctness") or {}
-        if not item.get("full_report_exists"):
+        ncu_required = item.get("ncu_expected", False)
+        if ncu_required and not item.get("full_report_exists"):
             continue
         if bench.get("has_reference") and not correctness.get("passed"):
             continue
@@ -665,6 +733,7 @@ def choose_best_iteration(iterations: list[dict[str, Any]]) -> dict[str, Any] | 
     )
 
 
+
 def render_iteration_markdown(record: dict[str, Any]) -> str:
     bench = record.get("benchmark_result") or {}
     correctness = bench.get("correctness") or {}
@@ -674,10 +743,11 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
         f"# Iteration v{record['iteration']}",
         "",
         "## Status",
+        f"- backend: {record.get('backend', 'unknown')}",
         f"- benchmark rc: {record['benchmark_rc']}",
         f"- targeted ncu rc: {record.get('targeted_ncu_rc')}",
         f"- full ncu rc: {record.get('full_ncu_rc')}",
-        f"- snapshot kernel: {record['snapshot_cu']}",
+        f"- snapshot file: {record['snapshot_file']}",
         f"- correctness checked: {correctness.get('checked')}",
         f"- correctness passed: {correctness.get('passed')}",
         "",
@@ -704,22 +774,38 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
         f"- full details: {record.get('full_import', {}).get('details_txt')}",
         "",
         "## Claude follow-up",
-        "- Read the targeted/full summaries and details before deciding the next optimization.",
-        "- Write the optimization hypothesis into optimization_proposal.md for this iteration.",
-        "- Only promote this version as best when correctness passes and the full report exists.",
-        "",
     ]
+
+    if record.get("ncu_expected"):
+        lines.extend(
+            [
+                "- Read the targeted/full summaries and details before deciding the next optimization.",
+                "- Write the optimization hypothesis into optimization_proposal.md for this iteration.",
+                "- Only promote this version as best when correctness passes and the full report exists.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "- Read the benchmark_result.json and iteration_summary.md before deciding the next optimization.",
+                "- Write the optimization hypothesis into optimization_proposal.md for this iteration.",
+            ]
+        )
+    lines.append("")
     return "\n".join(lines)
+
 
 
 def render_final_summary(manifest: dict[str, Any]) -> str:
     preflight = manifest.get("preflight") or {}
+    backend = manifest.get("backend", "unknown")
     lines = [
-        "# CUDA Optimization Loop Summary",
+        "# Operator Optimization Loop Summary",
         "",
         "## Run info",
         f"- run dir: {manifest['run_dir']}",
-        f"- source cu file: {manifest['source_cu_file']}",
+        f"- source file: {manifest['source_file']}",
+        f"- backend: {backend}",
         f"- reference file: {manifest['reference_file'] or 'not provided'}",
         f"- max iterations: {manifest['max_iterations']}",
         f"- warmup: {manifest['warmup']}",
@@ -727,44 +813,58 @@ def render_final_summary(manifest: dict[str, Any]) -> str:
         f"- gpu: {manifest['gpu']}",
         f"- arch: {manifest['arch'] or 'auto'}",
         f"- preflight ready: {'yes' if preflight.get('ready') else 'no'}" if preflight else "- preflight ready: not run",
+        f"- ncu supported: {'yes' if manifest.get('ncu_supported') else 'no'}",
         "",
-        "## Environment",
-        f"- gpu name: {preflight.get('gpu_name') or 'unknown'}" if preflight else "- gpu name: unknown",
-        f"- compute capability: {preflight.get('gpu_compute_capability') or 'unknown'}" if preflight else "- compute capability: unknown",
-        f"- nvcc: {preflight.get('nvcc_bin') or 'unknown'}" if preflight else "- nvcc: unknown",
-        f"- ncu: {preflight.get('ncu_bin') or 'unknown'}" if preflight else "- ncu: unknown",
-        f"- preflight report: {preflight.get('markdown_path')}" if preflight.get("markdown_path") else "- preflight report: not generated",
-        "",
-        "## Iterations",
-        "",
-        "| Iter | Correctness | Kernel median ms | Kernel avg ms | Full NCU | Snapshot |",
-        "| --- | --- | ---: | ---: | --- | --- |",
+        "## Reference docs",
     ]
+
+    docs = manifest.get("reference_docs") or []
+    if docs:
+        lines.extend(f"- {item}" for item in docs)
+    else:
+        lines.append("- none")
+
+    lines.extend(
+        [
+            "",
+            "## Environment",
+            f"- gpu name: {preflight.get('gpu_name') or 'unknown'}" if preflight else "- gpu name: unknown",
+            f"- compute capability: {preflight.get('gpu_compute_capability') or 'unknown'}" if preflight else "- compute capability: unknown",
+            f"- nvcc: {preflight.get('nvcc_bin') or 'not required'}" if preflight else "- nvcc: unknown",
+            f"- ncu: {preflight.get('ncu_bin') or 'not required'}" if preflight else "- ncu: unknown",
+            f"- preflight report: {preflight.get('markdown_path')}" if preflight.get("markdown_path") else "- preflight report: not generated",
+            "",
+            "## Iterations",
+            "",
+            "| Iter | Backend | Correctness | Kernel median ms | Kernel avg ms | Full NCU | Snapshot |",
+            "| --- | --- | --- | ---: | ---: | --- | --- |",
+        ]
+    )
 
     for item in manifest.get("iterations", []):
         bench = item.get("benchmark_result") or {}
         correctness = bench.get("correctness") or {}
         kernel = bench.get("kernel") or {}
-        correctness_value = correctness.get("passed")
         if not bench.get("has_reference"):
             correctness_text = "not checked"
         else:
-            correctness_text = "pass" if correctness_value else "fail"
+            correctness_text = "pass" if correctness.get("passed") else "fail"
         lines.append(
-            "| v{iteration} | {correctness} | {median} | {avg} | {full_report} | {snapshot} |".format(
+            "| v{iteration} | {backend} | {correctness} | {median} | {avg} | {full_report} | {snapshot} |".format(
                 iteration=item.get("iteration"),
+                backend=item.get("backend", backend),
                 correctness=correctness_text,
                 median=kernel.get("median_ms", "-"),
                 avg=kernel.get("average_ms", "-"),
-                full_report="yes" if item.get("full_report_exists") else "no",
-                snapshot=item.get("snapshot_cu", "-"),
+                full_report="yes" if item.get("full_report_exists") else ("n/a" if not item.get("ncu_expected") else "no"),
+                snapshot=item.get("snapshot_file", "-"),
             )
         )
 
     best_iteration = manifest.get("best_iteration")
     lines.extend(["", "## Best version"])
     if best_iteration is None:
-        lines.append("- No eligible best version yet. Need a correctness-passing iteration with a full NCU report.")
+        lines.append("- No eligible best version yet. Need a benchmark-successful iteration, correctness pass when reference exists, and full NCU report when backend supports NCU.")
     else:
         best = next(item for item in manifest["iterations"] if item["iteration"] == best_iteration)
         bench = best.get("benchmark_result") or {}
@@ -772,14 +872,14 @@ def render_final_summary(manifest: dict[str, Any]) -> str:
         lines.extend(
             [
                 f"- best iteration: v{best_iteration}",
-                f"- best kernel path: {best.get('snapshot_cu')}",
-                f"- full NCU report: {best.get('full_report')}",
-                f"- targeted NCU report: {best.get('targeted_report')}",
+                f"- best file path: {best.get('snapshot_file')}",
+                f"- full NCU report: {best.get('full_report') or 'n/a'}",
+                f"- targeted NCU report: {best.get('targeted_report') or 'n/a'}",
                 f"- kernel median ms: {kernel.get('median_ms')}",
                 f"- kernel average ms: {kernel.get('average_ms')}",
                 f"- speedup vs reference: {bench.get('speedup_vs_reference')}",
-                f"- full NCU import summary: {best.get('full_import', {}).get('summary_txt')}",
-                f"- full NCU import details: {best.get('full_import', {}).get('details_txt')}",
+                f"- full NCU import summary: {best.get('full_import', {}).get('summary_txt') or 'n/a'}",
+                f"- full NCU import details: {best.get('full_import', {}).get('details_txt') or 'n/a'}",
             ]
         )
 
@@ -788,7 +888,7 @@ def render_final_summary(manifest: dict[str, Any]) -> str:
             "",
             "## Required final answer checklist",
             "- Compare baseline vs best benchmark numbers.",
-            "- Cite the best full NCU report path.",
+            "- Cite the best full NCU report path when backend supports NCU.",
             "- Summarize the bottleneck and the winning optimization idea.",
             "- Mention any failed iterations and why they were rejected.",
             "",
@@ -797,9 +897,11 @@ def render_final_summary(manifest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
-    parser = argparse.ArgumentParser(description="Evaluate one iteration in a CUDA optimization loop")
-    parser.add_argument("cu_file", help="Path to the current .cu kernel file")
+    parser = argparse.ArgumentParser(description="Evaluate one iteration in an operator optimization loop")
+    parser.add_argument("solution_file", help="Path to the current operator file (.cu or .py)")
+    parser.add_argument("--backend", type=str, default="auto", choices=["auto", "cuda", "cutlass", "triton"], help="Backend type")
     parser.add_argument("--ref", type=str, default="", help="Optional Python reference file")
     parser.add_argument("--run-dir", type=str, default="", help="Existing or new run directory")
     parser.add_argument("--iteration", type=int, default=-1, help="Iteration index; defaults to next index")
@@ -824,6 +926,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, unknown
 
 
+
 def main() -> int:
     args, unknown = parse_args()
     if any(not (item.startswith("--") and "=" in item) for item in unknown):
@@ -833,14 +936,15 @@ def main() -> int:
 
     repo_root = Path(__file__).resolve().parents[4]
     benchmark_script = repo_root / "skills" / "optimized-skill" / "kernel-benchmark" / "scripts" / "benchmark.py"
-    cu_file = Path(args.cu_file).resolve()
+    solution_file = Path(args.solution_file).resolve()
+    backend = infer_backend(solution_file, args.backend)
     ref_file = Path(args.ref).resolve() if args.ref else None
 
-    run_dir = ensure_run_dir(cu_file, args.run_dir)
+    run_dir = ensure_run_dir(solution_file, args.run_dir)
     manifest_path = run_dir / "run_manifest.json"
     summary_path = run_dir / "final_summary.md"
-    manifest = load_manifest(manifest_path, args, run_dir)
-    preflight = collect_preflight(args, benchmark_script, cu_file, ref_file)
+    manifest = load_manifest(manifest_path, args, run_dir, solution_file, backend)
+    preflight = collect_preflight(args, benchmark_script, solution_file, ref_file, backend)
     preflight_json = run_dir / "preflight_check.json"
     preflight_md = run_dir / "preflight_check.md"
     write_json(preflight_json, preflight)
@@ -877,28 +981,31 @@ def main() -> int:
     iter_dir = run_dir / f"iter_v{iteration}"
     iter_dir.mkdir(parents=True, exist_ok=True)
 
-    snapshot_cu = iter_dir / f"{cu_file.stem}_v{iteration}{cu_file.suffix}"
-    shutil.copy2(cu_file, snapshot_cu)
+    snapshot_file = iter_dir / f"{solution_file.stem}_v{iteration}{solution_file.suffix}"
+    shutil.copy2(solution_file, snapshot_file)
     if ref_file:
         shutil.copy2(ref_file, iter_dir / ref_file.name)
 
     benchmark_json = iter_dir / "benchmark_result.json"
     benchmark_stdout = iter_dir / "benchmark.stdout.txt"
     benchmark_stderr = iter_dir / "benchmark.stderr.txt"
-    bench_cmd = build_benchmark_cmd(args, benchmark_script, snapshot_cu, benchmark_json)
+    bench_cmd = build_benchmark_cmd(args, benchmark_script, snapshot_file, benchmark_json, backend)
     bench_res = run_command(bench_cmd, benchmark_stdout, benchmark_stderr)
     bench_json = read_json(benchmark_json, {})
 
     record: dict[str, Any] = {
         "iteration": iteration,
         "created_at": now_iso(),
-        "snapshot_cu": str(snapshot_cu),
+        "backend": backend,
+        "snapshot_file": str(snapshot_file),
+        "snapshot_cu": str(snapshot_file),
         "benchmark_command": shell_join(bench_cmd),
         "benchmark_stdout": str(benchmark_stdout),
         "benchmark_stderr": str(benchmark_stderr),
         "benchmark_json": str(benchmark_json),
         "benchmark_rc": bench_res.returncode,
         "benchmark_result": bench_json,
+        "ncu_expected": backend_supports_ncu(backend),
         "targeted_ncu_rc": None,
         "full_ncu_rc": None,
         "targeted_report": "",
@@ -912,7 +1019,7 @@ def main() -> int:
     correctness = (bench_json or {}).get("correctness") or {}
     correctness_failed = bool(bench_json.get("has_reference")) and correctness.get("passed") is False
 
-    if bench_res.returncode == 0 and not correctness_failed:
+    if bench_res.returncode == 0 and not correctness_failed and backend_supports_ncu(backend):
         targeted_prefix = iter_dir / "targeted"
         targeted_stdout = iter_dir / "targeted_ncu.stdout.txt"
         targeted_stderr = iter_dir / "targeted_ncu.stderr.txt"
@@ -959,12 +1066,13 @@ def main() -> int:
     write_text(iter_dir / "iteration_summary.md", render_iteration_markdown(record))
     proposal_path = iter_dir / "optimization_proposal.md"
     if not proposal_path.exists():
-        write_text(
-            proposal_path,
-            "# Optimization proposal\n\n- Fill in the bottleneck diagnosis from the targeted/full NCU reports.\n- Describe the next kernel change for v{iteration_plus_one}.\n".format(
-                iteration_plus_one=iteration + 1
-            ),
-        )
+        if backend == "cuda":
+            proposal_stub = "# Optimization proposal\n\n## Backend\n- cuda\n\n## Primary references\n- skills/optimized-skill/reference/cuda/optim.md\n- skills/optimized-skill/reference/cuda/memory-optim.md\n- skills/optimized-skill/reference/cuda/compute-optim.md\n- skills/optimized-skill/reference/cuda/sync-optim.md\n\n## This iteration\n- Fill in the bottleneck diagnosis from the targeted/full NCU reports.\n- Describe the next kernel change for v{iteration_plus_one}.\n"
+        elif backend == "cutlass":
+            proposal_stub = "# Optimization proposal\n\n## Backend\n- cutlass\n\n## Primary references\n- skills/optimized-skill/reference/cutlass/cutlass-optim.md\n\n## This iteration\n- Fill in the bottleneck diagnosis from the targeted/full NCU reports.\n- Map the issue to CUTLASS-specific choices: Tensor Core path, tile shape, stage count, epilogue fusion, stream-k/split-k, swizzle, architecture-specific collective builder.\n- Describe the next kernel change for v{iteration_plus_one}.\n"
+        else:
+            proposal_stub = "# Optimization proposal\n\n## Backend\n- triton\n\n## Primary references\n- skills/optimized-skill/reference/triton/triton-optim.md\n\n## This iteration\n- Fill in the bottleneck diagnosis from the targeted/full NCU reports and benchmark results.\n- Map the issue to Triton-specific choices: BLOCK sizes, num_warps, num_stages, coalescing, vectorization hints, swizzle, persistent kernel, split-k, fusion.\n- Describe the next kernel change for v{iteration_plus_one}.\n"
+        write_text(proposal_path, proposal_stub.format(iteration_plus_one=iteration + 1))
 
     iterations = [item for item in manifest.get("iterations", []) if item.get("iteration") != iteration]
     iterations.append(record)
@@ -972,7 +1080,7 @@ def main() -> int:
     manifest["iterations"] = iterations
     best = choose_best_iteration(iterations)
     manifest["best_iteration"] = None if best is None else best["iteration"]
-    manifest["best_kernel_path"] = "" if best is None else best["snapshot_cu"]
+    manifest["best_kernel_path"] = "" if best is None else best["snapshot_file"]
     manifest["updated_at"] = now_iso()
 
     write_json(manifest_path, manifest)
