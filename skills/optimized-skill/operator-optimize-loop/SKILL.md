@@ -5,6 +5,37 @@ description: Run a CUDA operator optimization loop that enforces correctness val
 
 # CUDA Operator Optimization Loop
 
+## 运行前环境检查
+
+在执行任何 benchmark / NCU profiling 之前，必须先做 preflight 检查。`scripts/optimize_loop.py` 现在会默认检查并记录：
+
+- 本地 GPU 型号、compute capability、driver version
+- `--gpu` 指定的设备是否存在且可被当前 Python / PyTorch 访问
+- `torch` 是否可导入，以及 `torch.cuda.is_available()` 是否为 `true`
+- `nvcc` 与 `ncu` 是否存在，并记录解析后的可执行文件路径与版本信息
+- `benchmark.py`、输入 `.cu` 文件、可选 reference 文件是否存在
+
+检查结果会写入当前 run 目录：
+
+- `preflight_check.md`
+- `preflight_check.json`
+
+如果缺少必需环境，脚本会在进入 benchmark / targeted NCU / full NCU 之前直接失败退出。
+
+### 相关参数
+
+- `--nvcc-bin=<path or command>`: 指定 `nvcc`
+- `--ncu-bin=<path or command>`: 指定 `ncu`
+- `--preflight-only`: 只做环境检查并退出，不进入 benchmark/NCU
+
+### 需要的运行环境
+
+- NVIDIA GPU
+- 当前 Python 环境中的 `torch`
+- 当前 Python / PyTorch 能访问到 CUDA 设备
+- `nvcc`
+- `ncu`
+
 这个 skill 是 `skills/optimized-skill` 的统一主入口，用来把现有能力串成闭环：
 
 1. correctness validation
@@ -106,7 +137,7 @@ description: Run a CUDA operator optimization loop that enforces correctness val
 ```bash
 python skills/optimized-skill/operator-optimize-loop/scripts/optimize_loop.py <cu_file> \
     --max-iterations=<N> [--ref=<ref.py>] [--DIM=VALUE ...] \
-    --warmup=10 --repeat=20
+    --warmup=10 --repeat=20 [--nvcc-bin=<nvcc>] [--ncu-bin=<ncu>]
 ```
 
 如果已经有 run 目录，要继续同一轮次序列：
@@ -114,7 +145,15 @@ python skills/optimized-skill/operator-optimize-loop/scripts/optimize_loop.py <c
 ```bash
 python skills/optimized-skill/operator-optimize-loop/scripts/optimize_loop.py <next_version.cu> \
     --run-dir=<existing_run_dir> --iteration=<i> --max-iterations=<N> \
-    [--ref=<ref.py>] [--DIM=VALUE ...] --warmup=10 --repeat=20
+    [--ref=<ref.py>] [--DIM=VALUE ...] --warmup=10 --repeat=20 \
+    [--nvcc-bin=<nvcc>] [--ncu-bin=<ncu>]
+```
+
+只检查环境：
+
+```bash
+python skills/optimized-skill/operator-optimize-loop/scripts/optimize_loop.py <cu_file> \
+    --max-iterations=<N> --preflight-only [--nvcc-bin=<nvcc>] [--ncu-bin=<ncu>]
 ```
 
 ## 产物约定
@@ -122,6 +161,8 @@ python skills/optimized-skill/operator-optimize-loop/scripts/optimize_loop.py <n
 每次 run 都应生成一个 run 目录，目录下至少包含：
 - `run_manifest.json`
 - `final_summary.md`
+- `preflight_check.md`
+- `preflight_check.json`
 - `iter_v0/`, `iter_v1/`, ...
 
 每轮目录至少包含：

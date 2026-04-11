@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -64,16 +65,455 @@ def valid_report_exists(path: Path) -> bool:
 
 
 def run_command(cmd: list[str], stdout_path: Path, stderr_path: Path) -> subprocess.CompletedProcess:
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError as exc:
+        result = subprocess.CompletedProcess(cmd, 127, "", str(exc))
     write_text(stdout_path, result.stdout)
     write_text(stderr_path, result.stderr)
     return result
+
+
+def trim_output(text: str, max_lines: int = 20) -> str:
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    return "\n".join(lines[:max_lines] + ["..."])
+
+
+def add_requirement(
+    requirements: list[dict[str, Any]],
+    errors: list[str],
+    name: str,
+    ok: bool,
+    detail: str,
+    *,
+    required: bool = True,
+) -> None:
+    requirements.append(
+        {
+            "name": name,
+            "ok": ok,
+            "detail": detail,
+            "required": required,
+        }
+    )
+    if required and not ok:
+        errors.append(f"{name}: {detail}")
+
+
+def run_probe(cmd: list[str]) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError as exc:
+        return {
+            "command": shell_join(cmd),
+            "returncode": 127,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+    return {
+        "command": shell_join(cmd),
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def candidate_has_path(candidate: str) -> bool:
+    return any(sep in candidate for sep in ("\\", "/"))
+
+
+def find_cuda_roots() -> list[Path]:
+    roots: list[Path] = []
+    for env_name in ("CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"):
+        value = os.environ.get(env_name)
+        if value:
+            roots.append(Path(value))
+    return roots
+
+
+def find_ncu_roots() -> list[Path]:
+    roots: list[Path] = []
+    program_files = os.environ.get("ProgramFiles")
+    if program_files:
+        nvidia_dir = Path(program_files) / "NVIDIA Corporation"
+        if nvidia_dir.exists():
+            roots.extend(sorted(nvidia_dir.glob("Nsight Compute*")))
+    return roots
+
+
+def resolve_executable(candidate: str, tool_name: str) -> str:
+    candidate = candidate.strip().strip('"')
+    direct = Path(candidate).expanduser()
+    if direct.exists():
+        return str(direct.resolve())
+
+    resolved = shutil.which(candidate)
+    if resolved:
+        return resolved
+
+    if candidate_has_path(candidate):
+        return ""
+
+    extra_names = [candidate]
+    if os.name == "nt" and not Path(candidate).suffix:
+        extra_names.extend([f"{candidate}.exe", f"{candidate}.bat", f"{candidate}.cmd"])
+
+    search_roots: list[Path] = []
+    if tool_name == "nvcc":
+        search_roots.extend(root / "bin" for root in find_cuda_roots())
+    elif tool_name == "ncu":
+        search_roots.extend(find_ncu_roots())
+
+    for root in search_roots:
+        for name in extra_names:
+            probe = root / name
+            if probe.exists():
+                return str(probe.resolve())
+    return ""
+
+
+def probe_executable(candidate: str, tool_name: str, version_args: list[str]) -> dict[str, Any]:
+    resolved = resolve_executable(candidate, tool_name)
+    info: dict[str, Any] = {
+        "requested": candidate,
+        "resolved": resolved,
+        "exists": bool(resolved),
+        "version_command": "",
+        "version_returncode": None,
+        "version_output": "",
+    }
+    if not resolved:
+        return info
+
+    probe = run_probe([resolved, *version_args])
+    output = (probe["stdout"] or probe["stderr"]).strip()
+    info["version_command"] = probe["command"]
+    info["version_returncode"] = probe["returncode"]
+    info["version_output"] = trim_output(output)
+    return info
+
+
+def probe_nvidia_smi() -> dict[str, Any]:
+    resolved = shutil.which("nvidia-smi")
+    info: dict[str, Any] = {
+        "exists": bool(resolved),
+        "resolved": resolved or "",
+        "query_command": "",
+        "returncode": None,
+        "query_output": "",
+        "gpus": [],
+    }
+    if not resolved:
+        return info
+
+    primary = run_probe(
+        [resolved, "--query-gpu=name,compute_cap,driver_version", "--format=csv,noheader"]
+    )
+    probe = primary
+    if primary["returncode"] != 0 or not primary["stdout"].strip():
+        fallback = run_probe([resolved, "--query-gpu=name,driver_version", "--format=csv,noheader"])
+        if fallback["returncode"] == 0 and fallback["stdout"].strip():
+            probe = fallback
+
+    info["query_command"] = probe["command"]
+    info["returncode"] = probe["returncode"]
+    info["query_output"] = trim_output((probe["stdout"] or probe["stderr"]).strip())
+
+    if probe["returncode"] == 0:
+        for line in probe["stdout"].splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) >= 3:
+                info["gpus"].append(
+                    {
+                        "name": parts[0],
+                        "compute_capability": parts[1],
+                        "driver_version": parts[2],
+                    }
+                )
+            elif len(parts) >= 2:
+                info["gpus"].append(
+                    {
+                        "name": parts[0],
+                        "compute_capability": "",
+                        "driver_version": parts[1],
+                    }
+                )
+    return info
+
+
+def probe_torch_cuda(gpu_index: int) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "importable": False,
+        "version": "",
+        "cuda_version": "",
+        "cuda_available": False,
+        "device_count": 0,
+        "selected_gpu_index": gpu_index,
+        "selected_gpu_name": "",
+        "selected_gpu_compute_capability": "",
+        "selected_sm": "",
+        "error": "",
+    }
+    try:
+        import torch  # type: ignore
+    except Exception as exc:  # pragma: no cover - environment dependent
+        info["error"] = str(exc)
+        return info
+
+    info["importable"] = True
+    info["version"] = getattr(torch, "__version__", "")
+    info["cuda_version"] = getattr(torch.version, "cuda", "") or ""
+
+    try:
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        if info["cuda_available"]:
+            info["device_count"] = int(torch.cuda.device_count())
+            if 0 <= gpu_index < info["device_count"]:
+                info["selected_gpu_name"] = torch.cuda.get_device_name(gpu_index)
+                major, minor = torch.cuda.get_device_capability(gpu_index)
+                info["selected_gpu_compute_capability"] = f"{major}.{minor}"
+                info["selected_sm"] = f"sm_{major}{minor}"
+    except Exception as exc:  # pragma: no cover - environment dependent
+        info["error"] = str(exc)
+    return info
+
+
+def collect_preflight(
+    args: argparse.Namespace,
+    benchmark_script: Path,
+    cu_file: Path,
+    ref_file: Path | None,
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    errors: list[str] = []
+    requirements: list[dict[str, Any]] = []
+
+    preflight: dict[str, Any] = {
+        "checked_at": now_iso(),
+        "ready": False,
+        "python_executable": sys.executable,
+        "python_version": sys.version.splitlines()[0],
+        "selected_gpu_index": args.gpu,
+        "env_vars": {
+            "CUDA_PATH": os.environ.get("CUDA_PATH", ""),
+            "CUDA_HOME": os.environ.get("CUDA_HOME", ""),
+            "CUDA_ROOT": os.environ.get("CUDA_ROOT", ""),
+        },
+        "requirements": requirements,
+        "warnings": warnings,
+        "errors": errors,
+    }
+
+    add_requirement(
+        requirements,
+        errors,
+        "kernel file",
+        cu_file.exists(),
+        str(cu_file),
+    )
+    add_requirement(
+        requirements,
+        errors,
+        "kernel suffix",
+        cu_file.suffix.lower() == ".cu",
+        cu_file.suffix or "(no suffix)",
+    )
+    add_requirement(
+        requirements,
+        errors,
+        "benchmark.py",
+        benchmark_script.exists(),
+        str(benchmark_script),
+    )
+    add_requirement(
+        requirements,
+        errors,
+        "reference file",
+        ref_file is None or ref_file.exists(),
+        "not provided" if ref_file is None else str(ref_file),
+    )
+
+    torch_info = probe_torch_cuda(args.gpu)
+    preflight["torch"] = torch_info
+    add_requirement(
+        requirements,
+        errors,
+        "PyTorch import",
+        torch_info["importable"],
+        torch_info["version"] if torch_info["importable"] else (torch_info["error"] or "torch import failed"),
+    )
+    add_requirement(
+        requirements,
+        errors,
+        "CUDA runtime",
+        torch_info["cuda_available"],
+        (
+            f"torch CUDA {torch_info['cuda_version']}"
+            if torch_info["cuda_available"]
+            else (torch_info["error"] or "torch.cuda.is_available() returned false")
+        ),
+    )
+    selected_gpu_ok = (
+        torch_info["cuda_available"] and 0 <= args.gpu < int(torch_info["device_count"])
+    )
+    add_requirement(
+        requirements,
+        errors,
+        f"GPU index {args.gpu}",
+        selected_gpu_ok,
+        (
+            f"{torch_info['selected_gpu_name']} ({torch_info['selected_sm']})"
+            if selected_gpu_ok
+            else f"available device count: {torch_info['device_count']}"
+        ),
+    )
+
+    nvidia_smi_info = probe_nvidia_smi()
+    preflight["nvidia_smi"] = nvidia_smi_info
+    if not nvidia_smi_info["exists"]:
+        warnings.append("nvidia-smi not found; GPU model falls back to PyTorch detection.")
+    elif nvidia_smi_info.get("returncode") not in (None, 0):
+        warnings.append("nvidia-smi is present but GPU query failed.")
+
+    gpu_info: dict[str, Any] = {
+        "name": torch_info.get("selected_gpu_name", ""),
+        "compute_capability": torch_info.get("selected_gpu_compute_capability", ""),
+        "sm": torch_info.get("selected_sm", ""),
+        "driver_version": "",
+        "source": "torch" if torch_info.get("selected_gpu_name") else "",
+    }
+    if nvidia_smi_info.get("gpus") and args.gpu < len(nvidia_smi_info["gpus"]):
+        smi_gpu = nvidia_smi_info["gpus"][args.gpu]
+        if smi_gpu.get("name"):
+            gpu_info["name"] = smi_gpu["name"]
+            gpu_info["source"] = "nvidia-smi"
+        if smi_gpu.get("compute_capability"):
+            gpu_info["compute_capability"] = smi_gpu["compute_capability"]
+            if not gpu_info["sm"] and "." in smi_gpu["compute_capability"]:
+                major, minor = smi_gpu["compute_capability"].split(".", 1)
+                gpu_info["sm"] = f"sm_{major}{minor}"
+        if smi_gpu.get("driver_version"):
+            gpu_info["driver_version"] = smi_gpu["driver_version"]
+    preflight["gpu"] = gpu_info
+
+    nvcc_info = probe_executable(args.nvcc_bin, "nvcc", ["--version"])
+    preflight["nvcc"] = nvcc_info
+    add_requirement(
+        requirements,
+        errors,
+        "nvcc executable",
+        nvcc_info["exists"],
+        nvcc_info["resolved"] or f"cannot resolve {args.nvcc_bin}",
+    )
+    if nvcc_info["exists"] and nvcc_info.get("version_returncode") not in (None, 0):
+        warnings.append("nvcc exists but `--version` did not exit cleanly.")
+
+    ncu_info = probe_executable(args.ncu_bin, "ncu", ["--version"])
+    preflight["ncu"] = ncu_info
+    add_requirement(
+        requirements,
+        errors,
+        "ncu executable",
+        ncu_info["exists"],
+        ncu_info["resolved"] or f"cannot resolve {args.ncu_bin}",
+    )
+    if ncu_info["exists"] and ncu_info.get("version_returncode") not in (None, 0):
+        warnings.append("ncu exists but `--version` did not exit cleanly.")
+
+    if args.arch and gpu_info.get("sm") and args.arch != gpu_info["sm"]:
+        warnings.append(
+            f"--arch={args.arch} does not match selected GPU capability {gpu_info['sm']}."
+        )
+
+    preflight["ready"] = not errors
+    return preflight
+
+
+def render_preflight_markdown(preflight: dict[str, Any]) -> str:
+    lines = [
+        "# CUDA Optimization Loop Preflight",
+        "",
+        "## Status",
+        f"- ready: {'yes' if preflight.get('ready') else 'no'}",
+        f"- checked at: {preflight.get('checked_at', '')}",
+        f"- python: {preflight.get('python_executable', '')}",
+        f"- python version: {preflight.get('python_version', '')}",
+        f"- selected gpu index: {preflight.get('selected_gpu_index')}",
+        "",
+        "## Required environment",
+        "",
+        "| Requirement | Status | Detail |",
+        "| --- | --- | --- |",
+    ]
+
+    for item in preflight.get("requirements", []):
+        status = "ok" if item.get("ok") else "missing"
+        detail = str(item.get("detail", "")).replace("\n", "<br>")
+        lines.append(f"| {item.get('name')} | {status} | {detail} |")
+
+    gpu = preflight.get("gpu") or {}
+    torch_info = preflight.get("torch") or {}
+    nvidia_smi = preflight.get("nvidia_smi") or {}
+    nvcc = preflight.get("nvcc") or {}
+    ncu = preflight.get("ncu") or {}
+
+    lines.extend(
+        [
+            "",
+            "## GPU",
+            f"- model: {gpu.get('name') or 'unknown'}",
+            f"- compute capability: {gpu.get('compute_capability') or 'unknown'}",
+            f"- sm: {gpu.get('sm') or 'unknown'}",
+            f"- driver version: {gpu.get('driver_version') or 'unknown'}",
+            f"- source: {gpu.get('source') or 'unknown'}",
+            f"- torch: {torch_info.get('version') or 'not importable'}",
+            f"- torch cuda: {torch_info.get('cuda_version') or 'unknown'}",
+            f"- device count: {torch_info.get('device_count')}",
+            f"- nvidia-smi: {nvidia_smi.get('resolved') or 'not found'}",
+            "",
+            "## Tools",
+            f"- nvcc requested: {nvcc.get('requested', '')}",
+            f"- nvcc resolved: {nvcc.get('resolved') or 'not found'}",
+            f"- nvcc version: {nvcc.get('version_output') or 'n/a'}",
+            f"- ncu requested: {ncu.get('requested', '')}",
+            f"- ncu resolved: {ncu.get('resolved') or 'not found'}",
+            f"- ncu version: {ncu.get('version_output') or 'n/a'}",
+            "",
+            "## Environment variables",
+            f"- CUDA_PATH: {preflight.get('env_vars', {}).get('CUDA_PATH') or '(unset)'}",
+            f"- CUDA_HOME: {preflight.get('env_vars', {}).get('CUDA_HOME') or '(unset)'}",
+            f"- CUDA_ROOT: {preflight.get('env_vars', {}).get('CUDA_ROOT') or '(unset)'}",
+            "",
+            "## Errors",
+        ]
+    )
+
+    if preflight.get("errors"):
+        lines.extend(f"- {item}" for item in preflight["errors"])
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Warnings"])
+    if preflight.get("warnings"):
+        lines.extend(f"- {item}" for item in preflight["warnings"])
+    else:
+        lines.append("- none")
+
+    return "\n".join(lines)
 
 
 def ensure_run_dir(cu_file: Path, run_dir_arg: str) -> Path:
@@ -103,6 +543,7 @@ def load_manifest(manifest_path: Path, args: argparse.Namespace, run_dir: Path) 
             "ptr_size": args.ptr_size,
             "seed": args.seed,
             "dims_args": list(args.dim_args),
+            "preflight": {},
             "iterations": [],
             "best_iteration": None,
             "best_kernel_path": "",
@@ -128,6 +569,7 @@ def build_benchmark_cmd(args: argparse.Namespace, benchmark_script: Path, snapsh
         f"--atol={args.atol}",
         f"--rtol={args.rtol}",
         f"--json-out={benchmark_json}",
+        f"--nvcc-bin={args.nvcc_bin}",
     ]
     if args.ref:
         cmd.append(f"--ref={Path(args.ref).resolve()}")
@@ -271,6 +713,7 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
 
 
 def render_final_summary(manifest: dict[str, Any]) -> str:
+    preflight = manifest.get("preflight") or {}
     lines = [
         "# CUDA Optimization Loop Summary",
         "",
@@ -283,6 +726,14 @@ def render_final_summary(manifest: dict[str, Any]) -> str:
         f"- repeat: {manifest['repeat']}",
         f"- gpu: {manifest['gpu']}",
         f"- arch: {manifest['arch'] or 'auto'}",
+        f"- preflight ready: {'yes' if preflight.get('ready') else 'no'}" if preflight else "- preflight ready: not run",
+        "",
+        "## Environment",
+        f"- gpu name: {preflight.get('gpu_name') or 'unknown'}" if preflight else "- gpu name: unknown",
+        f"- compute capability: {preflight.get('gpu_compute_capability') or 'unknown'}" if preflight else "- compute capability: unknown",
+        f"- nvcc: {preflight.get('nvcc_bin') or 'unknown'}" if preflight else "- nvcc: unknown",
+        f"- ncu: {preflight.get('ncu_bin') or 'unknown'}" if preflight else "- ncu: unknown",
+        f"- preflight report: {preflight.get('markdown_path')}" if preflight.get("markdown_path") else "- preflight report: not generated",
         "",
         "## Iterations",
         "",
@@ -363,8 +814,10 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--seed", type=int, default=42, help="Random seed passed to benchmark.py")
     parser.add_argument("--launch-skip", type=int, default=20, help="NCU launch-skip value")
     parser.add_argument("--launch-count", type=int, default=1, help="NCU launch-count value")
+    parser.add_argument("--nvcc-bin", type=str, default="nvcc", help="NVCC executable or full path")
     parser.add_argument("--ncu-bin", type=str, default="ncu", help="Nsight Compute executable")
     parser.add_argument("--kernel-name-regex", type=str, default="", help="Optional NCU kernel filter regex")
+    parser.add_argument("--preflight-only", action="store_true", help="Only run environment checks and exit")
 
     args, unknown = parser.parse_known_args()
     args.dim_args = [item for item in unknown if item.startswith("--") and "=" in item]
@@ -381,20 +834,44 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[4]
     benchmark_script = repo_root / "skills" / "optimized-skill" / "kernel-benchmark" / "scripts" / "benchmark.py"
     cu_file = Path(args.cu_file).resolve()
-    if not cu_file.exists():
-        print(f"Kernel file not found: {cu_file}", file=sys.stderr)
-        return 2
-    if args.ref and not Path(args.ref).resolve().exists():
-        print(f"Reference file not found: {Path(args.ref).resolve()}", file=sys.stderr)
-        return 2
-    if not benchmark_script.exists():
-        print(f"benchmark.py not found: {benchmark_script}", file=sys.stderr)
-        return 2
+    ref_file = Path(args.ref).resolve() if args.ref else None
 
     run_dir = ensure_run_dir(cu_file, args.run_dir)
     manifest_path = run_dir / "run_manifest.json"
     summary_path = run_dir / "final_summary.md"
     manifest = load_manifest(manifest_path, args, run_dir)
+    preflight = collect_preflight(args, benchmark_script, cu_file, ref_file)
+    preflight_json = run_dir / "preflight_check.json"
+    preflight_md = run_dir / "preflight_check.md"
+    write_json(preflight_json, preflight)
+    write_text(preflight_md, render_preflight_markdown(preflight))
+    manifest["preflight"] = {
+        "checked_at": preflight["checked_at"],
+        "ready": preflight["ready"],
+        "gpu_name": (preflight.get("gpu") or {}).get("name", ""),
+        "gpu_compute_capability": (preflight.get("gpu") or {}).get("compute_capability", ""),
+        "nvcc_bin": (preflight.get("nvcc") or {}).get("resolved", ""),
+        "ncu_bin": (preflight.get("ncu") or {}).get("resolved", ""),
+        "json_path": str(preflight_json),
+        "markdown_path": str(preflight_md),
+        "errors": list(preflight.get("errors", [])),
+        "warnings": list(preflight.get("warnings", [])),
+    }
+    write_json(manifest_path, manifest)
+    write_text(summary_path, render_final_summary(manifest))
+
+    if preflight.get("nvcc", {}).get("resolved"):
+        args.nvcc_bin = preflight["nvcc"]["resolved"]
+    if preflight.get("ncu", {}).get("resolved"):
+        args.ncu_bin = preflight["ncu"]["resolved"]
+
+    if args.preflight_only or not preflight.get("ready"):
+        if not preflight.get("ready"):
+            print(f"Preflight failed. See {preflight_md}", file=sys.stderr)
+            for item in preflight.get("errors", []):
+                print(f"- {item}", file=sys.stderr)
+            return 2
+        return 0
 
     iteration = pick_iteration_index(manifest, args.iteration)
     iter_dir = run_dir / f"iter_v{iteration}"
@@ -402,8 +879,8 @@ def main() -> int:
 
     snapshot_cu = iter_dir / f"{cu_file.stem}_v{iteration}{cu_file.suffix}"
     shutil.copy2(cu_file, snapshot_cu)
-    if args.ref:
-        shutil.copy2(Path(args.ref).resolve(), iter_dir / Path(args.ref).name)
+    if ref_file:
+        shutil.copy2(ref_file, iter_dir / ref_file.name)
 
     benchmark_json = iter_dir / "benchmark_result.json"
     benchmark_stdout = iter_dir / "benchmark.stdout.txt"

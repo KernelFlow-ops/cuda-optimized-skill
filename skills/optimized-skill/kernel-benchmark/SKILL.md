@@ -23,6 +23,7 @@ description: Compile, validate, and benchmark a CUDA kernel against an optional 
 - 可选：维度参数，如 `--M=... --N=... --K=...`
 - 可选：`--warmup`、`--repeat`、`--arch`、`--gpu`、`--ptr-size`
 - 可选：`--atol`、`--rtol`、`--seed`
+- 可选：`--nvcc-bin=<path or command>`，指定 `nvcc`
 - 可选：`--json-out=<file>`，把结构化结果写成 JSON，便于上层编排脚本复用
 
 ## reference 推断规则
@@ -53,28 +54,28 @@ description: Compile, validate, and benchmark a CUDA kernel against an optional 
 
 ```bash
 python skills/optimized-skill/kernel-benchmark/scripts/benchmark.py <cu_file> \
-    [--DIM=VALUE ...] --warmup=10 --repeat=20
+    [--DIM=VALUE ...] --warmup=10 --repeat=20 [--nvcc-bin=<nvcc>]
 ```
 
 验证加 benchmark：
 
 ```bash
 python skills/optimized-skill/kernel-benchmark/scripts/benchmark.py <cu_file> \
-    --ref=<ref_file> [--DIM=VALUE ...] --warmup=10 --repeat=20
+    --ref=<ref_file> [--DIM=VALUE ...] --warmup=10 --repeat=20 [--nvcc-bin=<nvcc>]
 ```
 
 指定架构：
 
 ```bash
 python skills/optimized-skill/kernel-benchmark/scripts/benchmark.py <cu_file> \
-    --ref=<ref_file> [--DIM=VALUE ...] --arch=sm_90
+    --ref=<ref_file> [--DIM=VALUE ...] --arch=sm_90 [--nvcc-bin=<nvcc>]
 ```
 
 输出结构化 JSON：
 
 ```bash
 python skills/optimized-skill/kernel-benchmark/scripts/benchmark.py <cu_file> \
-    --ref=<ref_file> [--DIM=VALUE ...] --json-out=benchmark_result.json
+    --ref=<ref_file> [--DIM=VALUE ...] --json-out=benchmark_result.json [--nvcc-bin=<nvcc>]
 ```
 
 ## benchmark.py 的实际行为

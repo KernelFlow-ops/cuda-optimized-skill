@@ -129,10 +129,12 @@ def parse_solve_signature(cu_file: str):
     return params
 
 
-def detect_arch() -> str:
+def detect_arch(device_index: int | None = None) -> str:
     """Auto-detect GPU compute capability and return sm_XX string."""
     if torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability(0)
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device_index)
         return f"sm_{major}{minor}"
     return "sm_80"
 
@@ -155,10 +157,10 @@ def _preprocess_cu(cu_file: str) -> str:
     return tmp
 
 
-def compile_cu(cu_file: str, output_so: str, arch: str):
+def compile_cu(cu_file: str, output_so: str, arch: str, nvcc_bin: str):
     """Compile .cu to a shared library."""
     clean_file = _preprocess_cu(cu_file)
-    cmd = ["nvcc", "-shared", "-std=c++17", f"-arch={arch}", "-O3", "-o", output_so, clean_file]
+    cmd = [nvcc_bin, "-shared", "-std=c++17", f"-arch={arch}", "-O3", "-o", output_so, clean_file]
     if os.name != "nt":
         cmd[2:2] = ["-Xcompiler", "-fPIC"]
     else:
@@ -167,13 +169,19 @@ def compile_cu(cu_file: str, output_so: str, arch: str):
             "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
         ]
     print(f"[compile] {' '.join(cmd)}")
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError as exc:
+        if clean_file != cu_file and os.path.exists(clean_file):
+            os.remove(clean_file)
+        print(f"Compilation failed:\n{exc}", file=sys.stderr)
+        sys.exit(1)
     if clean_file != cu_file and os.path.exists(clean_file):
         os.remove(clean_file)
     if result.returncode != 0:
@@ -285,11 +293,12 @@ def _write_json_out(path: str, payload: dict):
 def _print_results(label, avg, med, mn, mx, total_ptr_bytes, ptr_elems,
                    cu_file, dim_values, arch, ref_avg=None):
     """Print benchmark results table; append speedup line when ref_avg is given."""
+    gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
     print()
     print("=" * 55)
     print(f"  {label}")
     print(f"  Kernel       : {os.path.basename(cu_file)}")
-    print(f"  GPU          : {torch.cuda.get_device_name(0)}")
+    print(f"  GPU          : {gpu_name}")
     print(f"  Arch         : {arch}")
     print(f"  Dims         : {dim_values}")
     print(f"  Buf/ptr      : {ptr_elems} elems")
@@ -358,7 +367,7 @@ def _validate_outputs(kernel_tensors, ref_tensors, output_params, atol, rtol):
 # Setup: compile + allocate buffers
 # ---------------------------------------------------------------------------
 
-def _setup(cu_file, dim_values, ptr_size_override, arch, seed=None):
+def _setup(cu_file, dim_values, ptr_size_override, arch, nvcc_bin, seed=None):
     """Parse signature, compile kernel, allocate tensors.
 
     Returns:
@@ -378,7 +387,7 @@ def _setup(cu_file, dim_values, ptr_size_override, arch, seed=None):
 
     lib_ext = ".dll" if os.name == "nt" else ".so"
     so_file = os.path.splitext(cu_file)[0] + lib_ext
-    compile_cu(cu_file, so_file, arch)
+    compile_cu(cu_file, so_file, arch, nvcc_bin)
     lib = ctypes.CDLL(so_file)
 
     # -- validate dimensions --------------------------------------------------
@@ -442,7 +451,7 @@ def _setup(cu_file, dim_values, ptr_size_override, arch, seed=None):
 # ---------------------------------------------------------------------------
 
 def run(cu_file, ref_file, dim_values, warmup, repeat,
-        ptr_size_override, arch, atol, rtol, seed, json_out=""):
+        ptr_size_override, arch, atol, rtol, seed, json_out="", nvcc_bin="nvcc"):
     """Main benchmark pipeline.
 
     Steps:
@@ -497,7 +506,12 @@ def run(cu_file, ref_file, dim_values, warmup, repeat,
     # -- compile + allocate ---------------------------------------------------
     (lib, params, kernel_tensors, kernel_call_args,
      argtypes, output_params, ptr_elems, total_ptr_bytes) = _setup(
-        cu_file, dim_values, ptr_size_override, arch, seed=seed if has_ref else None
+        cu_file,
+        dim_values,
+        ptr_size_override,
+        arch,
+        nvcc_bin,
+        seed=seed if has_ref else None,
     )
     result["signature"] = [
         {"type": ptype, "name": pname, "is_const": is_const}
@@ -544,7 +558,7 @@ def run(cu_file, ref_file, dim_values, warmup, repeat,
         print("=" * 60)
         print(f"  Kernel    : {os.path.basename(cu_file)}")
         print(f"  Reference : {os.path.basename(ref_file)}")
-        print(f"  GPU       : {torch.cuda.get_device_name(0)}")
+        print(f"  GPU       : {gpu_name}")
         print(f"  Arch      : {arch}")
         print(f"  Dims      : {dim_values}")
         print(f"  Buf/ptr   : {ptr_elems} elems")
@@ -665,6 +679,8 @@ def main():
                         help="Random seed for input tensors when validating (default: 42)")
     parser.add_argument("--json-out", type=str, default="",
                         help="Optional path to write structured benchmark results as JSON")
+    parser.add_argument("--nvcc-bin", type=str, default="nvcc",
+                        help="NVCC executable or full path")
 
     args, unknown = parser.parse_known_args()
 
@@ -677,7 +693,7 @@ def main():
             print(f"Warning: ignoring unknown arg '{u}'", file=sys.stderr)
 
     torch.cuda.set_device(args.gpu)
-    arch = args.arch if args.arch else detect_arch()
+    arch = args.arch if args.arch else detect_arch(args.gpu)
 
     run(
         cu_file           = args.cu_file,
@@ -691,6 +707,7 @@ def main():
         rtol              = args.rtol,
         seed              = args.seed,
         json_out          = args.json_out,
+        nvcc_bin          = args.nvcc_bin,
     )
 
 
